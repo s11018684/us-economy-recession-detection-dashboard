@@ -1,0 +1,35 @@
+High Yield OAS
+Excess Bond Premium
+Chicago Fed NFCI
+
+Yield Curve 
+US10Y - US02Y
+US10Y - US03M
+US10Y - FEDFUNDS
+
+Bank lending standards (SLOOS)
+
+unrate
+Unemployment Insurance Weekly Claims
+UI Continued Claims
+Nonfarm Payrolls
+
+CPI
+Core CPI
+PCE
+Core PCE
+
+PMI
+WILL5000INDFC (monthly) ÷ GDP (forward-filled to monthly)
+
+
+US GDP
+US Real GDP
+FEDFUNDS
+
+
+
+
+
+
+Your registered API key is: a20309d1cb21546f10d519422282c399 Documentation is available on the St. Louis Fed web services website.
