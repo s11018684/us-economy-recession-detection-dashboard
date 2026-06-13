@@ -1,17 +1,16 @@
 """
-US Macro Dashboard v2 — Recession & Bear Market Risk Monitor
+US Macro Dashboard v3 — Recession & Bear Market Risk Monitor
 ============================================================
 Indicator set (expanded):
 
 0. 🚨 Composite Risk Score
    - Aggregates yield curve, Sahm, EBP prob, NFCI, SLOOS, HY OAS into 0-100 score
-   - Real-time alert banner with crossed thresholds
 
 1. Credit & Risk
    - High Yield OAS              → BAMLH0A0HYM2
    - Excess Bond Premium         → Fed Board CSV (ebp_csv.csv)
    - Chicago Fed NFCI            → NFCI
-   - Baa - 10Y spread            → BAA10Y (equity risk premium proxy)
+   - Baa - 10Y spread            → BAA10Y
    - VIX                         → VIXCLS
 
 2. Yield Curve & Lending
@@ -20,7 +19,7 @@ Indicator set (expanded):
 
 3. Labor Market
    - UNRATE, ICSA, CCSA, PAYEMS
-   - Sahm Rule                   → SAHMREALTIME  (NEW — best coincident recession signal)
+   - Sahm Rule                   → SAHMREALTIME
 
 4. Inflation
    - CPI / Core CPI / PCE / Core PCE
@@ -28,14 +27,22 @@ Indicator set (expanded):
 5. Activity & Markets
    - CFNAI + State LEI (USSLIND) + PMI proxy (fixed-reference normalized)
    - Buffett Indicator with recalibrated Z.1 valuation bands
+   - Equity Market Value ÷ M2  (NEW — liquidity-adjusted valuation)
+       * NOTE: Wilshire 5000 series were REMOVED from FRED on 2024-06-03, so we
+         use Z.1 equity market value (NCBEILQ027S) ÷ M2SL as the faithful
+         total-market-cap-to-money substitute.
+   - Equity Risk Premium (NEW)
+       * ERP = S&P 500 earnings yield − 10Y REAL Treasury yield
+       * earnings yield proxied by CP ÷ NCBEILQ027S (Fed model)
+       * real yield = REAINTRATREARAT10Y (fallback DFII10)
 
-6. Housing (NEW)
+6. Housing
    - PERMIT, HOUST, MORTGAGE30US
 
-7. Consumer (NEW)
+7. Consumer
    - UMCSENT, RSAFS YoY, PSAVERT
 
-8. Liquidity & Policy (NEW)
+8. Liquidity & Policy
    - M2SL YoY, WALCL (Fed balance sheet), FEDFUNDS, GDP / GDPC1
 
 Setup:
@@ -64,19 +71,6 @@ from plotly.subplots import make_subplots
 # ---------------------------------------------------------------------------
 load_dotenv()
 
-# Try Streamlit secrets first (cloud), fall back to .env (local)
-FRED_API_KEY = ""
-try:
-    FRED_API_KEY = st.secrets["FRED_API_KEY"]
-except (FileNotFoundError, KeyError, Exception):
-    FRED_API_KEY = os.getenv("FRED_API_KEY", "")
-
-if not FRED_API_KEY:
-    st.error("⚠️ FRED API key not found. Set it in `.env` locally or in Streamlit Secrets when deployed.")
-    st.stop()
-
-fred = Fred(api_key=FRED_API_KEY)
-
 st.set_page_config(
     page_title="US Macro Risk Monitor",
     page_icon="🚨",
@@ -84,9 +78,15 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-FRED_API_KEY = os.getenv("FRED_API_KEY", "")
+# Try Streamlit secrets first (cloud), fall back to .env (local)
+FRED_API_KEY = ""
+try:
+    FRED_API_KEY = st.secrets["FRED_API_KEY"]
+except Exception:
+    FRED_API_KEY = os.getenv("FRED_API_KEY", "")
+
 if not FRED_API_KEY:
-    st.error("⚠️ FRED API key not found. Create `.env` with `FRED_API_KEY=your_key_here`.")
+    st.error("⚠️ FRED API key not found. Set it in `.env` locally or in Streamlit Secrets when deployed.")
     st.stop()
 
 fred = Fred(api_key=FRED_API_KEY)
@@ -259,6 +259,36 @@ def fixed_ref_zscore(s: pd.Series, ref_start: str = REF_START,
     return (s - ref.mean()) / ref.std()
 
 
+def percentile_bands(s: pd.Series, ref_start: str = REF_START):
+    """Generic post-REF_START percentile bands (P20/P50/P80/P95)."""
+    ref = s.loc[ref_start:].dropna() if s is not None and not s.empty else pd.Series(dtype=float)
+    if ref.empty:
+        return None
+    return {
+        "p20": float(np.percentile(ref, 20)),
+        "p50": float(np.percentile(ref, 50)),
+        "p80": float(np.percentile(ref, 80)),
+        "p95": float(np.percentile(ref, 95)),
+    }
+
+
+def _align_monthly(series_dict: dict, end) -> pd.DataFrame:
+    """Forward-fill a dict of {name: Series} onto a common month-end index."""
+    series_dict = {k: v.dropna() for k, v in series_dict.items() if v is not None and not v.dropna().empty}
+    if not series_dict:
+        return pd.DataFrame()
+    starts = [v.index.min() for v in series_dict.values()]
+    ends_  = [v.index.max() for v in series_dict.values()]
+    end_ts = pd.Timestamp(_to_date_str(end)) if end is not None else max(ends_)
+    monthly_idx = pd.date_range(start=max(starts), end=min(max(ends_), end_ts), freq="ME")
+    if len(monthly_idx) == 0:
+        return pd.DataFrame()
+    out = {}
+    for k, v in series_dict.items():
+        out[k] = v.reindex(v.index.union(monthly_idx)).sort_index().ffill().reindex(monthly_idx)
+    return pd.DataFrame(out).dropna()
+
+
 # ---------------------------------------------------------------------------
 # BUFFETT INDICATOR (Z.1 version)
 # ---------------------------------------------------------------------------
@@ -272,30 +302,75 @@ def compute_buffett_indicator(start, end, fetch_start) -> pd.Series:
     gdp = fetch_series("GDP", "1945-01-01", end, silent=True).dropna()
     if gdp.empty:
         return pd.Series(dtype=float, name="Buffett")
-    monthly_idx = pd.date_range(
-        start=min(eq_b.index.min(), gdp.index.min()),
-        end=max(eq_b.index.max(), gdp.index.max()),
-        freq="ME",
-    )
-    eq_m  = eq_b.reindex(eq_b.index.union(monthly_idx)).sort_index().ffill().reindex(monthly_idx)
-    gdp_m = gdp.reindex(gdp.index.union(monthly_idx)).sort_index().ffill().reindex(monthly_idx)
-    df = pd.concat([eq_m.rename("EQ_B"), gdp_m.rename("GDP_B")], axis=1).dropna()
+    df = _align_monthly({"EQ_B": eq_b, "GDP_B": gdp}, end)
     if df.empty:
         return pd.Series(dtype=float, name="Buffett")
     return (df["EQ_B"] / df["GDP_B"] * 100).rename("Buffett")
 
 
 def buffett_percentile_bands(buf_full: pd.Series):
-    """Compute valuation bands from the post-1990 distribution of Z.1 Buffett."""
-    ref = buf_full.loc[REF_START:].dropna()
-    if ref.empty:
-        return None
-    return {
-        "p20": float(np.percentile(ref, 20)),
-        "p50": float(np.percentile(ref, 50)),
-        "p80": float(np.percentile(ref, 80)),
-        "p95": float(np.percentile(ref, 95)),
-    }
+    return percentile_bands(buf_full, REF_START)
+
+
+# ---------------------------------------------------------------------------
+# EQUITY MARKET VALUE ÷ M2   (replacement for WILL5000/M2)
+# ---------------------------------------------------------------------------
+def compute_equity_m2(end) -> pd.Series:
+    """Total equity market value ÷ M2 money supply — liquidity-adjusted valuation.
+
+    NOTE: FRED removed ALL Wilshire 5000 series on 2024-06-03, so the original
+    'WILL5000 / M2' cannot be built. We substitute the Z.1 market value of
+    corporate equities (NCBEILQ027S, billions) — a true total-market-cap series,
+    conceptually the closest match to the Wilshire 5000 total market — divided by
+    M2SL (billions). Rising ratio = equities expensive relative to money supply.
+    """
+    eq = fetch_series("NCBEILQ027S", "1950-01-01", end, silent=True).dropna()
+    if eq.empty:
+        eq = fetch_series("MVEONWMVBSNNCB", "1950-01-01", end, silent=True).dropna()
+    if eq.empty:
+        return pd.Series(dtype=float, name="Equity MktCap / M2")
+    eq_b = eq / 1000.0  # millions -> billions
+    m2 = fetch_series("M2SL", "1950-01-01", end, silent=True).dropna()  # $ billions, monthly
+    if m2.empty:
+        return pd.Series(dtype=float, name="Equity MktCap / M2")
+    df = _align_monthly({"EQ_B": eq_b, "M2_B": m2}, end)
+    if df.empty:
+        return pd.Series(dtype=float, name="Equity MktCap / M2")
+    return (df["EQ_B"] / df["M2_B"]).rename("Equity MktCap / M2")
+
+
+# ---------------------------------------------------------------------------
+# EQUITY RISK PREMIUM   (S&P 500 earnings yield − 10Y REAL yield)
+# ---------------------------------------------------------------------------
+def compute_erp(end) -> pd.Series:
+    """Equity Risk Premium = S&P 500 earnings yield − 10Y REAL Treasury yield.
+
+    FRED has no direct S&P 500 earnings-yield series, so the earnings yield is
+    proxied by the economy-wide Fed-model earnings yield:
+        after-tax corporate profits (CP, $bn) ÷ market value of equities
+        (NCBEILQ027S, $bn) × 100.
+    The real yield uses the Cleveland Fed 10-Year Real Interest Rate
+    (REAINTRATREARAT10Y, since 1982); falls back to TIPS (DFII10, since 2003).
+    """
+    eq = fetch_series("NCBEILQ027S", "1950-01-01", end, silent=True).dropna()
+    if eq.empty:
+        eq = fetch_series("MVEONWMVBSNNCB", "1950-01-01", end, silent=True).dropna()
+    cp = fetch_series("CP", "1950-01-01", end, silent=True).dropna()  # $ billions, SAAR
+    if eq.empty or cp.empty:
+        return pd.Series(dtype=float, name="ERP")
+    eq_b = eq / 1000.0  # millions -> billions
+
+    real = fetch_series("REAINTRATREARAT10Y", "1950-01-01", end, silent=True).dropna()  # %
+    if real.empty:
+        real = fetch_series("DFII10", "1950-01-01", end, silent=True).dropna()
+    if real.empty:
+        return pd.Series(dtype=float, name="ERP")
+
+    df = _align_monthly({"EQ_B": eq_b, "CP_B": cp, "REAL": real}, end)
+    if df.empty:
+        return pd.Series(dtype=float, name="ERP")
+    earnings_yield = (df["CP_B"] / df["EQ_B"]) * 100.0  # %
+    return (earnings_yield - df["REAL"]).rename("ERP")
 
 
 # ---------------------------------------------------------------------------
@@ -303,24 +378,21 @@ def buffett_percentile_bands(buf_full: pd.Series):
 # ---------------------------------------------------------------------------
 def compute_risk_score():
     """
-    Build a composite recession risk score from:
+    Composite recession risk score:
       - Yield curve (10Y-3M)        20%
       - Sahm Rule                   20%
       - EBP recession probability   20%
       - NFCI                        15%
       - SLOOS C&I tightening        15%
       - HY OAS deviation            10%
-    Each component scored 0-100; weighted average returned.
-    Also returns dict of component scores and triggered alerts.
     """
     components = {}
     alerts = []
 
-    # 1. Yield curve 10Y-3M (inverted ⇒ high risk)
+    # 1. Yield curve 10Y-3M
     t10y3m = fetch_series("T10Y3M", silent=True).dropna()
     yc_val = latest_scalar(t10y3m)
     if yc_val is not None:
-        # -1.5% ⇒ 100, 0% ⇒ 60, +2% ⇒ 0
         score = float(np.clip(60 - yc_val * 30, 0, 100))
         components["Yield Curve (10Y-3M)"] = (score, f"{yc_val:+.2f}%")
         if yc_val < 0:
@@ -330,7 +402,6 @@ def compute_risk_score():
     sahm = fetch_series("SAHMREALTIME", silent=True).dropna()
     sahm_val = latest_scalar(sahm)
     if sahm_val is not None:
-        # 0 ⇒ 0, 0.5 (trigger) ⇒ 90, 1.0+ ⇒ 100
         score = float(np.clip(sahm_val * 180, 0, 100))
         components["Sahm Rule"] = (score, f"{sahm_val:+.2f}")
         if sahm_val >= 0.5:
@@ -340,7 +411,6 @@ def compute_risk_score():
 
     # 3. EBP-based recession probability
     ebp_df = fetch_ebp_csv()
-    ebp_prob_val = None
     if not ebp_df.empty and "est_prob" in ebp_df.columns:
         prob_series = ebp_df["est_prob"].dropna()
         if not prob_series.empty:
@@ -357,7 +427,6 @@ def compute_risk_score():
     nfci = fetch_series("NFCI", silent=True).dropna()
     nfci_val = latest_scalar(nfci)
     if nfci_val is not None:
-        # -1 ⇒ 0, 0 ⇒ 50, +1 ⇒ 90, +2 ⇒ 100
         score = float(np.clip(50 + nfci_val * 40, 0, 100))
         components["NFCI"] = (score, f"{nfci_val:+.2f}")
         if nfci_val > 0:
@@ -367,7 +436,6 @@ def compute_risk_score():
     sloos = fetch_series("DRTSCILM", silent=True).dropna()
     sloos_val = latest_scalar(sloos)
     if sloos_val is not None:
-        # -20 ⇒ 0, 0 ⇒ 40, +20 ⇒ 75, +50+ ⇒ 100
         score = float(np.clip(40 + sloos_val * 1.5, 0, 100))
         components["SLOOS Tightening"] = (score, f"{sloos_val:+.1f}%")
         if sloos_val >= 30:
@@ -387,7 +455,6 @@ def compute_risk_score():
         elif z >= 1.0:
             alerts.append(f"⚠️ HY OAS elevated (z={z:+.1f}σ)")
 
-    # Weighted composite
     weights = {
         "Yield Curve (10Y-3M)": 0.20,
         "Sahm Rule":            0.20,
@@ -485,14 +552,13 @@ st.caption(f"Range: **{start_date}** → **{end_date}** • "
 
 
 # =========================================================================
-# 0. RISK SCORE & ALERTS  (NEW — landing page)
+# 0. RISK SCORE & ALERTS
 # =========================================================================
 if section == "🚨 Risk Score & Alerts":
     st.subheader("Composite Recession Risk Score")
 
     composite, components, alerts = compute_risk_score()
 
-    # ---- Top row: gauge + alerts ----
     col_g, col_a = st.columns([1, 2])
 
     with col_g:
@@ -509,10 +575,10 @@ if section == "🚨 Risk Score & Alerts":
                     "axis": {"range": [0, 100]},
                     "bar":  {"color": color, "thickness": 0.3},
                     "steps": [
-                        {"range": [0, 30],   "color": "#d5f5e3"},  # low
-                        {"range": [30, 55],  "color": "#fcf3cf"},  # moderate
-                        {"range": [55, 75],  "color": "#f5b7b1"},  # elevated
-                        {"range": [75, 100], "color": "#d2b4de"},  # extreme
+                        {"range": [0, 30],   "color": "#d5f5e3"},
+                        {"range": [30, 55],  "color": "#fcf3cf"},
+                        {"range": [55, 75],  "color": "#f5b7b1"},
+                        {"range": [75, 100], "color": "#d2b4de"},
                     ],
                     "threshold": {"line": {"color": "black", "width": 3},
                                   "thickness": 0.75, "value": composite},
@@ -552,7 +618,6 @@ if section == "🚨 Risk Score & Alerts":
 
     st.markdown("---")
 
-    # ---- Component bar chart ----
     if components:
         st.subheader("Component Risk Contributions")
         names = list(components.keys())
@@ -882,15 +947,21 @@ elif section == "💰 Inflation":
 
 
 # =========================================================================
-# 5. ACTIVITY & MARKETS — CFNAI, USSLIND, fixed-ref PMI proxy, Buffett
+# 5. ACTIVITY & MARKETS — CFNAI, USSLIND, PMI proxy, Buffett, Equity/M2, ERP
 # =========================================================================
 elif section == "🏭 Activity & Markets":
     st.subheader("Activity & Markets")
 
     st.info(
-        "**Buffett Indicator** = `NCBEILQ027S` (Z.1 Corporate Equities, quarterly) ÷ "
-        "`GDP` × 100%, ffilled to monthly. Valuation bands recalibrated to "
-        f"post-{REF_START[:4]} percentile distribution of the Z.1 series."
+        "**Buffett** = Z.1 equities ÷ GDP × 100%.  \n"
+        "**Equity MktCap / M2** = total equity market value (Z.1 `NCBEILQ027S`) ÷ M2 "
+        "money supply — liquidity-adjusted valuation. *(FRED removed all Wilshire 5000 "
+        "series on 2024-06-03, so Z.1 total market value is used as the faithful "
+        "total-market-cap substitute for the original WILL5000/M2.)*  \n"
+        "**ERP** = S&P 500 earnings yield − 10Y **real** Treasury yield "
+        "(`REAINTRATREARAT10Y`). Earnings yield proxied by `CP` ÷ `NCBEILQ027S` "
+        "(Fed model). Bands recalibrated to "
+        f"post-{REF_START[:4]} percentile distribution."
     )
 
     cfnai = clip_range(fetch_series("CFNAI", fetch_start, end_date), start_date, end_date)
@@ -910,18 +981,36 @@ elif section == "🏭 Activity & Markets":
     buffett = clip_range(buffett_full, start_date, end_date)
     bands = buffett_percentile_bands(buffett_full)
 
+    # NEW — Equity market value / M2 (replacement for WILL5000/M2)
+    eqm2_full = compute_equity_m2(end_date)
+    eqm2 = clip_range(eqm2_full, start_date, end_date)
+    eqm2_bands = percentile_bands(eqm2_full)
+
+    # NEW — Equity Risk Premium (S&P500 earnings yield − 10Y real yield)
+    erp_full = compute_erp(end_date)
+    erp = clip_range(erp_full, start_date, end_date)
+    erp_bands = percentile_bands(erp_full)
+
+    # ---- metrics ----
     c1, c2, c3, c4 = st.columns(4)
     with c1: st.metric("CFNAI", latest_value(cfnai, "{:+.2f}"))
     with c2: st.metric("State LEI", latest_value(usslind, "{:+.2f}"))
     with c3: st.metric("PMI proxy (fixed-ref)", latest_value(pmi_proxy, "{:.1f}"))
     with c4: st.metric("Buffett (Z.1)", latest_value(buffett, "{:.1f}", "%"))
 
-    fig = make_subplots(rows=4, cols=1,
+    d1, d2, d3, d4 = st.columns(4)
+    with d1: st.metric("Equity MktCap / M2", latest_value(eqm2, "{:.2f}"))
+    with d2: st.metric("Equity Risk Premium", latest_value(erp, "{:+.2f}", "%"))
+
+    fig = make_subplots(rows=6, cols=1,
                         subplot_titles=["CFNAI — Chicago Fed National Activity Index",
                                         "USSLIND — State Leading Index",
                                         f"PMI-style Proxy (z-scored vs {REF_START[:4]}-{REF_END[:4]})",
-                                        "Buffett Indicator — Z.1 Equities ÷ GDP"],
-                        vertical_spacing=0.08)
+                                        "Buffett Indicator — Z.1 Equities ÷ GDP",
+                                        "Equity Market Value ÷ M2 — Liquidity-Adjusted Valuation",
+                                        "Equity Risk Premium (Earnings Yield − 10Y Real Yield)"],
+                        vertical_spacing=0.05)
+
     if not cfnai.empty:
         fig.add_trace(go.Scatter(x=cfnai.index, y=cfnai.values,
                                  line=dict(color="steelblue")), row=1, col=1)
@@ -954,11 +1043,41 @@ elif section == "🏭 Activity & Markets":
                               annotation_text=label, annotation_position="right",
                               row=4, col=1)
         maybe_shade(fig, row=4, col=1)
+    if not eqm2.dropna().empty:
+        fig.add_trace(go.Scatter(x=eqm2.index, y=eqm2.values,
+                                 line=dict(color="indigo", width=2)), row=5, col=1)
+        if eqm2_bands:
+            for level, label, color in [
+                (eqm2_bands["p20"], f"P20 ({eqm2_bands['p20']:.2f})", "green"),
+                (eqm2_bands["p50"], f"Median ({eqm2_bands['p50']:.2f})", "gray"),
+                (eqm2_bands["p80"], f"P80 ({eqm2_bands['p80']:.2f})", "orange"),
+                (eqm2_bands["p95"], f"P95 ({eqm2_bands['p95']:.2f})", "red"),
+            ]:
+                fig.add_hline(y=level, line_dash="dot", line_color=color,
+                              annotation_text=label, annotation_position="right",
+                              row=5, col=1)
+        maybe_shade(fig, row=5, col=1)
+    if not erp.dropna().empty:
+        fig.add_trace(go.Scatter(x=erp.index, y=erp.values,
+                                 line=dict(color="darkred", width=2),
+                                 fill="tozeroy", fillcolor="rgba(139,0,0,0.08)"),
+                      row=6, col=1)
+        fig.add_hline(y=0, line_dash="dash", line_color="gray",
+                      annotation_text="0% (stocks = real bonds)", row=6, col=1)
+        if erp_bands:
+            fig.add_hline(y=erp_bands["p50"], line_dash="dot", line_color="orange",
+                          annotation_text=f"Median ({erp_bands['p50']:+.1f}%)",
+                          annotation_position="right", row=6, col=1)
+            fig.add_hline(y=erp_bands["p20"], line_dash="dot", line_color="red",
+                          annotation_text=f"P20 ({erp_bands['p20']:+.1f}%)",
+                          annotation_position="right", row=6, col=1)
+        maybe_shade(fig, row=6, col=1)
 
-    fig.update_layout(height=1100, showlegend=False, hovermode="x unified")
+    fig.update_layout(height=1700, showlegend=False, hovermode="x unified")
     apply_xrange(fig, start_date, end_date)
     st.plotly_chart(fig, width='stretch')
 
+    # ---- interpretation messages ----
     if bands and not buffett.dropna().empty:
         cur = buffett.dropna().iloc[-1]
         pct = (buffett_full.loc[REF_START:].dropna() <= cur).mean() * 100
@@ -969,9 +1088,32 @@ elif section == "🏭 Activity & Markets":
             f"averaged ~0–3% annualized vs ~10% baseline."
         )
 
+    if eqm2_bands and not eqm2.dropna().empty:
+        cur = eqm2.dropna().iloc[-1]
+        pct = (eqm2_full.loc[REF_START:].dropna() <= cur).mean() * 100
+        st.info(
+            f"**Equity MktCap / M2: {cur:.2f}** — **{pct:.0f}th percentile** of post-"
+            f"{REF_START[:4]} readings. High = equities richly valued relative to the "
+            f"money supply (liquidity already absorbed); low = abundant liquidity vs market value. "
+            f"*(Z.1 total equity market value used as Wilshire-5000 substitute.)*"
+        )
+
+    if erp_bands and not erp.dropna().empty:
+        cur = erp.dropna().iloc[-1]
+        pct = (erp_full.loc[REF_START:].dropna() <= cur).mean() * 100
+        verdict = ("stocks richly priced vs real bonds — thin risk compensation"
+                   if cur < erp_bands["p20"] else
+                   "stocks attractively priced vs real bonds" if cur > erp_bands["p80"]
+                   else "near historical norm")
+        st.warning(
+            f"**Equity Risk Premium: {cur:+.2f}%** — **{pct:.0f}th percentile** of "
+            f"post-{REF_START[:4]} readings ({verdict}). A low/negative ERP has historically "
+            f"preceded weak equity returns and elevated bear-market risk."
+        )
+
 
 # =========================================================================
-# 6. HOUSING (NEW)
+# 6. HOUSING
 # =========================================================================
 elif section == "🏘️ Housing":
     st.subheader("Housing — Leading Indicator of the Cycle")
@@ -1011,7 +1153,7 @@ elif section == "🏘️ Housing":
 
 
 # =========================================================================
-# 7. CONSUMER (NEW)
+# 7. CONSUMER
 # =========================================================================
 elif section == "🛍️ Consumer":
     st.subheader("Consumer — 70% of US GDP")
@@ -1054,7 +1196,7 @@ elif section == "🛍️ Consumer":
 
 
 # =========================================================================
-# 8. LIQUIDITY & MONEY (NEW)
+# 8. LIQUIDITY & MONEY
 # =========================================================================
 elif section == "💵 Liquidity & Money":
     st.subheader("Money Supply & Fed Balance Sheet")
